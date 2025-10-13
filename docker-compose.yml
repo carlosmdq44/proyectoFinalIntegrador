@@ -1,0 +1,21 @@
+services:
+  spark:
+    image: jupyter/pyspark-notebook:latest
+    container_name: spark-local
+    working_dir: /home/jovyan/app
+    volumes:
+      - ./:/home/jovyan/app
+    environment:
+      - SPARK_LOCAL_IP=${SPARK_LOCAL_IP}
+      - SPARK_DRIVER_BIND_ADDRESS=${SPARK_DRIVER_BIND_ADDRESS}
+      - INPUT_BUCKET=${INPUT_BUCKET}
+      - RUN_DATE=${RUN_DATE}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - PYSPARK_SUBMIT_ARGS=--packages org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.696 pyspark-shell
+
+    command: >
+      bash -lc "
+      pip install pyspark==3.5.0 -r requirements.txt || pip install pyspark==3.5.0;
+      sleep infinity"
