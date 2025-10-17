@@ -33,6 +33,29 @@ FACT_PATH = "gold/marts/fact_sales_daily"
 
 
 # -----------------------------
+# Helpers particionado/idempotencia
+# -----------------------------
+def with_dt(df: DataFrame, run_date: str) -> DataFrame:
+    """Agrega columna de partición estándar dt=YYYY-MM-DD para DQ / backfills."""
+    return df.withColumn("dt", F.lit(run_date))
+
+
+def safe_partitions(df: DataFrame) -> DataFrame:
+    """
+    Evita NULLs en columnas usadas como partición (si existen).
+    Evita __HIVE_DEFAULT_PARTITION__.
+    """
+    fill_map = {}
+    if "txn_date" in df.columns:
+        fill_map["txn_date"] = "1970-01-01"
+    if "region" in df.columns:
+        fill_map["region"] = "unknown"
+    if "category" in df.columns:
+        fill_map["category"] = "unknown"
+    return df.fillna(fill_map)
+
+
+# -----------------------------
 # Lectura de SILVER (ES schema)
 # -----------------------------
 def load_transactions(spark, silver_base: str, run_date: str | None) -> DataFrame:
@@ -60,15 +83,14 @@ def load_transactions(spark, silver_base: str, run_date: str | None) -> DataFram
         df = spark.read.option("mergeSchema", "true").parquet(f"{silver_base}/transactions")
 
     # Compat: fecha -> txn_date (DATE)
-    if "txn_date" not in df.columns:
+    if "txn_date" not in df.columns and "fecha" in df.columns:
         df = df.withColumn("txn_date", F.to_date(F.col("fecha")))
 
     # Aliases para KPIs (usamos nombres “neutros” que ya tenías)
-    # unit_price <- precio ; unit_cost puede faltar, lo resolvemos en margin_by_product
     if "unit_price" not in df.columns and "precio" in df.columns:
         df = df.withColumn("unit_price", F.col("precio"))
 
-    # También resguardamos nombres “ingleses” usados en KPIs, a partir de ES:
+    # Map de renombres comunes ES -> EN
     rename_map = {
         # ids
         "id": "txn_id",
@@ -82,8 +104,7 @@ def load_transactions(spark, silver_base: str, run_date: str | None) -> DataFram
         "metodo_pago": "payment_method",
         # metrics
         "cantidad": "quantity",
-        "precio": "unit_price",   # ya creado arriba; igualamos por compat
-        # revenue ya es revenue
+        "precio": "unit_price",
     }
     for src, tgt in rename_map.items():
         if src in df.columns and tgt not in df.columns:
@@ -98,7 +119,7 @@ def load_transactions(spark, silver_base: str, run_date: str | None) -> DataFram
 # -----------------------------
 # KPIs
 # -----------------------------
-def top_products_by_category(df: DataFrame, base_bucket: str) -> DataFrame:
+def top_products_by_category(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
     aggregated = df.groupBy("category", "product_id", "product_name", "txn_date").agg(
         F.sum("revenue").alias("daily_revenue"),
         F.sum("quantity").alias("daily_quantity"),
@@ -118,18 +139,18 @@ def top_products_by_category(df: DataFrame, base_bucket: str) -> DataFrame:
 
     ranked = ranked.filter(F.col("rank") <= 10)
     output_path = f"{base_bucket}/{GOLD_KPI_PATHS['top_products_by_category']}"
-    ranked_to_write = repartition_if_necessary(ranked)
+    ranked_to_write = repartition_if_necessary(safe_partitions(with_dt(ranked, run_date)))
     (
         ranked_to_write.write.mode("overwrite")
         .format("parquet")
         .option("compression", "snappy")
-        .partitionBy("txn_date", "category")
+        .partitionBy("dt", "txn_date", "category")
         .save(output_path)
     )
     return ranked
 
 
-def customer_frequency_ticket(df: DataFrame, base_bucket: str) -> DataFrame:
+def customer_frequency_ticket(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
     monthly = df.withColumn("txn_month", F.date_trunc("month", "txn_date"))
     metrics = monthly.groupBy("txn_month", "customer_id", "region").agg(
         F.approx_count_distinct("txn_id").alias("transaction_count"),
@@ -138,18 +159,18 @@ def customer_frequency_ticket(df: DataFrame, base_bucket: str) -> DataFrame:
         F.sum("quantity").alias("items_purchased"),
     )
     output_path = f"{base_bucket}/{GOLD_KPI_PATHS['customer_frequency_ticket']}"
-    metrics_to_write = repartition_if_necessary(metrics)
+    metrics_to_write = repartition_if_necessary(safe_partitions(with_dt(metrics, run_date)))
     (
         metrics_to_write.write.mode("overwrite")
         .format("parquet")
         .option("compression", "snappy")
-        .partitionBy("txn_month")
+        .partitionBy("dt", "txn_month")
         .save(output_path)
     )
     return metrics
 
 
-def revenue_by_region(df: DataFrame, base_bucket: str) -> DataFrame:
+def revenue_by_region(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
     weekly = df.withColumn("period_start", F.date_trunc("week", "txn_date"))
     weekly_metrics = weekly.groupBy("period_start", "region").agg(
         F.sum("revenue").alias("weekly_revenue"),
@@ -173,18 +194,18 @@ def revenue_by_region(df: DataFrame, base_bucket: str) -> DataFrame:
 
     combined = weekly_metrics.unionByName(monthly_metrics, allowMissingColumns=True)
     output_path = f"{base_bucket}/{GOLD_KPI_PATHS['revenue_by_region']}"
-    combined_to_write = repartition_if_necessary(combined)
+    combined_to_write = repartition_if_necessary(safe_partitions(with_dt(combined, run_date)))
     (
         combined_to_write.write.mode("overwrite")
         .format("parquet")
         .option("compression", "snappy")
-        .partitionBy("period_type", "period_start")
+        .partitionBy("dt", "period_type", "period_start")
         .save(output_path)
     )
     return combined
 
 
-def new_vs_returning(df: DataFrame, base_bucket: str) -> DataFrame:
+def new_vs_returning(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
     monthly = df.withColumn("txn_month", F.date_trunc("month", "txn_date"))
     customer_months = monthly.select("customer_id", "txn_month").distinct()
     customer_flags = (
@@ -202,36 +223,36 @@ def new_vs_returning(df: DataFrame, base_bucket: str) -> DataFrame:
         F.col("returning_customers") / F.greatest(F.col("returning_customers") + F.col("new_customers"), F.lit(1)),
     )
     output_path = f"{base_bucket}/{GOLD_KPI_PATHS['new_vs_returning']}"
-    mix_to_write = repartition_if_necessary(mix)
+    mix_to_write = repartition_if_necessary(safe_partitions(with_dt(mix, run_date)))
     (
         mix_to_write.write.mode("overwrite")
         .format("parquet")
         .option("compression", "snappy")
-        .partitionBy("txn_month")
+        .partitionBy("dt", "txn_month")
         .save(output_path)
     )
     return mix
 
 
-def price_volume_corr(df: DataFrame, base_bucket: str) -> DataFrame:
+def price_volume_corr(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
     corr_df = df.groupBy("category").agg(
         F.corr(F.col("unit_price"), F.col("quantity")).alias("price_volume_corr"),
         F.avg("unit_price").alias("avg_unit_price"),
         F.avg("quantity").alias("avg_quantity"),
     )
     output_path = f"{base_bucket}/{GOLD_KPI_PATHS['price_volume_corr']}"
-    corr_to_write = repartition_if_necessary(corr_df)
+    corr_to_write = repartition_if_necessary(with_dt(corr_df, run_date))
     (
         corr_to_write.write.mode("overwrite")
         .format("parquet")
         .option("compression", "snappy")
+        .partitionBy("dt")
         .save(output_path)
     )
     return corr_df
 
 
-def margin_by_product(df: DataFrame, base_bucket: str, default_cost_factor: float) -> DataFrame:
-
+def margin_by_product(df: DataFrame, base_bucket: str, default_cost_factor: float, run_date: str) -> DataFrame:
     if "unit_cost" not in df.columns:
         df = df.withColumn("unit_cost", F.lit(None).cast("double"))
 
@@ -246,36 +267,36 @@ def margin_by_product(df: DataFrame, base_bucket: str, default_cost_factor: floa
     )
     metrics = metrics.withColumn("margin", F.col("total_revenue") - F.col("total_cost"))
     output_path = f"{base_bucket}/{GOLD_KPI_PATHS['margin_by_product']}"
-    metrics_to_write = repartition_if_necessary(metrics)
+    metrics_to_write = repartition_if_necessary(safe_partitions(with_dt(metrics, run_date)))
     (
         metrics_to_write.write.mode("overwrite")
         .format("parquet")
         .option("compression", "snappy")
-        .partitionBy("category")
+        .partitionBy("dt", "category")
         .save(output_path)
     )
     return metrics
 
 
-def channel_payment_perf(df: DataFrame, base_bucket: str) -> DataFrame:
+def channel_payment_perf(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
     metrics = df.groupBy("channel", "payment_method", "region", "txn_date").agg(
         F.sum("revenue").alias("revenue"),
         F.sum("quantity").alias("items_sold"),
         F.approx_count_distinct("txn_id").alias("orders"),
     )
     output_path = f"{base_bucket}/{GOLD_KPI_PATHS['channel_payment_perf']}"
-    metrics_to_write = repartition_if_necessary(metrics)
+    metrics_to_write = repartition_if_necessary(safe_partitions(with_dt(metrics, run_date)))
     (
         metrics_to_write.write.mode("overwrite")
         .format("parquet")
         .option("compression", "snappy")
-        .partitionBy("txn_date", "region")
+        .partitionBy("dt", "txn_date", "region")
         .save(output_path)
     )
     return metrics
 
 
-def anomalies(df: DataFrame, base_bucket: str) -> DataFrame:
+def anomalies(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
     daily = df.groupBy("txn_date", "region", "category").agg(
         F.sum("revenue").alias("daily_revenue"),
         F.sum("quantity").alias("daily_quantity"),
@@ -293,18 +314,18 @@ def anomalies(df: DataFrame, base_bucket: str) -> DataFrame:
         (F.col("daily_revenue") - F.col("mean_revenue")) / F.col("std_revenue"),
     ).withColumn("is_anomaly", F.abs(F.col("z_score")) >= F.lit(3))
     output_path = f"{base_bucket}/{GOLD_KPI_PATHS['anomalies']}"
-    anomalies_to_write = repartition_if_necessary(anomalies_df)
+    anomalies_to_write = repartition_if_necessary(safe_partitions(with_dt(anomalies_df, run_date)))
     (
         anomalies_to_write.write.mode("overwrite")
         .format("parquet")
         .option("compression", "snappy")
-        .partitionBy("txn_date", "region")
+        .partitionBy("dt", "txn_date", "region")
         .save(output_path)
     )
     return anomalies_df
 
 
-def weather_impact(df: DataFrame, base_bucket: str) -> DataFrame:
+def weather_impact(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
     # Asume que df ya tiene columnas de clima (weather_avg_temp, weather_precipitation)
     metrics = df.groupBy("region").agg(
         F.corr("weather_avg_temp", "revenue").alias("corr_temp_revenue"),
@@ -313,17 +334,18 @@ def weather_impact(df: DataFrame, base_bucket: str) -> DataFrame:
         F.avg("weather_precipitation").alias("avg_precip"),
     )
     output_path = f"{base_bucket}/{GOLD_KPI_PATHS['weather_impact']}"
-    metrics_to_write = repartition_if_necessary(metrics)
+    metrics_to_write = repartition_if_necessary(with_dt(metrics, run_date))
     (
         metrics_to_write.write.mode("overwrite")
         .format("parquet")
         .option("compression", "snappy")
+        .partitionBy("dt")
         .save(output_path)
     )
     return metrics
 
 
-def fact_sales_daily(df: DataFrame, base_bucket: str) -> DataFrame:
+def fact_sales_daily(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
     fact = df.groupBy("txn_date", "region", "store_id", "category").agg(
         F.approx_count_distinct("txn_id").alias("orders"),
         F.sum("quantity").alias("items_sold"),
@@ -359,12 +381,12 @@ def fact_sales_daily(df: DataFrame, base_bucket: str) -> DataFrame:
     fact = fact.join(payment_mix, ["txn_date", "region", "store_id", "category"], "left")
 
     output_path = f"{base_bucket}/{FACT_PATH}"
-    fact_to_write = repartition_if_necessary(fact)
+    fact_to_write = repartition_if_necessary(safe_partitions(with_dt(fact, run_date)))
     (
         fact_to_write.write.mode("overwrite")
         .format("parquet")
         .option("compression", "snappy")
-        .partitionBy("txn_date", "region")
+        .partitionBy("dt", "txn_date", "region")
         .save(output_path)
     )
     return fact
@@ -383,6 +405,10 @@ def main(argv: List[str] | None = None) -> int:
     logger = build_logger("gold_analytics")
 
     spark = build_spark_session("gold_analytics")
+
+    # ✅ Idempotencia por partición
+    spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+
     base_bucket = args.input_bucket.rstrip("/")
 
     # Ajuste: path de referencia para decidir particiones de shuffle → usamos partición run_date
@@ -398,24 +424,26 @@ def main(argv: List[str] | None = None) -> int:
     transactions = attach_weather(transactions, weather)
 
     transactions.cache()
-    logger.info("Loaded %s rows from silver transactions (with weather columns: %s)",
-                transactions.count(),
-                ", ".join([c for c in ["weather_avg_temp", "weather_precipitation", "weather_code"] if
-                           c in transactions.columns]))
+    logger.info(
+        "Loaded %s rows from silver transactions (with weather columns: %s)",
+        transactions.count(),
+        ", ".join([c for c in ["weather_avg_temp", "weather_precipitation", "weather_code"]
+                   if c in transactions.columns])
+    )
 
     outputs = {}
-    outputs["top_products_by_category"] = top_products_by_category(transactions, base_bucket)
-    outputs["customer_frequency_ticket"] = customer_frequency_ticket(transactions, base_bucket)
-    outputs["revenue_by_region"] = revenue_by_region(transactions, base_bucket)
-    outputs["new_vs_returning"] = new_vs_returning(transactions, base_bucket)
-    outputs["price_volume_corr"] = price_volume_corr(transactions, base_bucket)
+    outputs["top_products_by_category"] = top_products_by_category(transactions, base_bucket, run_date)
+    outputs["customer_frequency_ticket"] = customer_frequency_ticket(transactions, base_bucket, run_date)
+    outputs["revenue_by_region"] = revenue_by_region(transactions, base_bucket, run_date)
+    outputs["new_vs_returning"] = new_vs_returning(transactions, base_bucket, run_date)
+    outputs["price_volume_corr"] = price_volume_corr(transactions, base_bucket, run_date)
     outputs["margin_by_product"] = margin_by_product(
-        transactions, base_bucket, default_cost_factor=args.default_cost_factor
+        transactions, base_bucket, default_cost_factor=args.default_cost_factor, run_date=run_date
     )
-    outputs["channel_payment_perf"] = channel_payment_perf(transactions, base_bucket)
-    outputs["anomalies"] = anomalies(transactions, base_bucket)
-    outputs["weather_impact"] = weather_impact(transactions, base_bucket)
-    fact_df = fact_sales_daily(transactions, base_bucket)
+    outputs["channel_payment_perf"] = channel_payment_perf(transactions, base_bucket, run_date)
+    outputs["anomalies"] = anomalies(transactions, base_bucket, run_date)
+    outputs["weather_impact"] = weather_impact(transactions, base_bucket, run_date)
+    fact_df = fact_sales_daily(transactions, base_bucket, run_date)
 
     for name, df in outputs.items():
         table_name = f"gold_kpi_{name}"
@@ -427,24 +455,28 @@ def main(argv: List[str] | None = None) -> int:
 
     return 0
 
+
 def load_weather(spark, silver_base: str, run_date: str) -> DataFrame | None:
     path = f"{silver_base}/weather_daily/run_date={run_date}"
     try:
         df = (spark.read
-                .option("mergeSchema", "true")
-                .parquet(path))
+              .option("mergeSchema", "true")
+              .parquet(path))
         print(f"[gold] Leyendo weather desde partición: {path}")
         return df
     except AnalysisException:
         print(f"[gold] Weather no encontrado en {path}. Seguimos sin clima.")
         return None
 
+
 def attach_weather(transactions: DataFrame, weather: DataFrame | None) -> DataFrame:
     if weather is None:
         df = transactions
         for name, dtype in [("weather_avg_temp", "double"),
                             ("weather_precipitation", "double"),
-                            ("weather_code", "string")]:
+                            ("weather_code", "string"),
+                            ("weather_wind_speed", "double"),
+                            ("weather_humidity", "double")]:
             if name not in df.columns:
                 df = df.withColumn(name, F.lit(None).cast(dtype))
         return df
@@ -457,7 +489,7 @@ def attach_weather(transactions: DataFrame, weather: DataFrame | None) -> DataFr
         base_cols = ["region", "weather_date"]
 
     existing_weather_cols = [c for c in desired if c in weather.columns]
-    w = weather.select(*( [c for c in base_cols if c in weather.columns] + existing_weather_cols )).alias("w")
+    w = weather.select(*([c for c in base_cols if c in weather.columns] + existing_weather_cols)).alias("w")
     t = transactions.alias("t")
 
     # detectar si weather.region está completamente nulo
@@ -471,19 +503,20 @@ def attach_weather(transactions: DataFrame, weather: DataFrame | None) -> DataFr
 
     df = (
         t.join(w, cond, how="left")
-         .select(
-             F.col("t.*"),
-             *[F.col(f"w.{c}") for c in existing_weather_cols],
-         )
+        .select(
+            F.col("t.*"),
+            *[F.col(f"w.{c}") for c in existing_weather_cols],
+        )
     )
 
-    # crear columnas faltantes como NULL (ej. weather_code)
+    # crear columnas faltantes como NULL (ej. weather_code) si hiciera falta
     for c in desired:
         if c not in df.columns:
             dtype = "double" if c != "weather_code" else "string"
             df = df.withColumn(c, F.lit(None).cast(dtype))
 
     return df
+
 
 if __name__ == "__main__":
     sys.exit(main())

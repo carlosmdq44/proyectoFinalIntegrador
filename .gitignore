@@ -1,6 +1,7 @@
 @"
 # Entornos / secretos
 .env
+*.env
 
 # Python / Spark
 __pycache__/
