@@ -28,3 +28,7 @@ jobs:
           context: .
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/pi3-spark:latest
+
+      - name: Print environment (optional debug)
+        run: |
+          echo "Build done at $(date)"
