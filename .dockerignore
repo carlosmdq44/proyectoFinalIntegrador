@@ -1,0 +1,12 @@
+@"
+.git
+__pycache__/
+*.pyc
+.env
+*.env
+.venv/
+venv/
+node_modules/
+data/
+.ipynb_checkpoints/
+"@ | Set-Content -Encoding UTF8 .dockerignore
