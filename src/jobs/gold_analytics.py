@@ -1,4 +1,16 @@
-# """Gold analytics job generating KPIs and fact tables from silver transactions."""
+# src/jobs/gold_analytics.py
+"""
+Gold analytics job: genera KPIs y tablas de hechos a partir de SILVER.
+
+💡 Cómo contarlo en tu defensa oral (TL;DR):
+- **Objetivo del job**: consumir transacciones limpias de SILVER, adjuntar clima y derivar
+  KPIs (por categoría, cliente, región, etc.) + la **tabla de hechos** `fact_sales_daily`.
+- **Buenas prácticas**: 
+  * *Idempotencia por partición* (`partitionOverwriteMode=dynamic`).
+  * *Escritura particionada* (por `dt`, fecha de la transacción y dims clave para pruning).
+  * *Esquemas tolerantes* (renombres ES→EN, columnas faltantes como NULL) para no romper flujos.
+- **Salida**: Parquet en rutas `gold/kpis/*` y `gold/marts/fact_sales_daily` + `register_table` para consulta.
+"""
 from __future__ import annotations
 
 import sys
@@ -17,6 +29,7 @@ from .utils import (
     repartition_if_necessary,
 )
 
+# 📁 Rutas destino (por KPI) y tabla de hechos
 GOLD_KPI_PATHS = {
     "top_products_by_category": "gold/kpis/top_products_by_category",
     "customer_frequency_ticket": "gold/kpis/customer_frequency_ticket",
@@ -33,17 +46,17 @@ FACT_PATH = "gold/marts/fact_sales_daily"
 
 
 # -----------------------------
-# Helpers particionado/idempotencia
+# Helpers de particionado / idempotencia
 # -----------------------------
 def with_dt(df: DataFrame, run_date: str) -> DataFrame:
-    """Agrega columna de partición estándar dt=YYYY-MM-DD para DQ / backfills."""
+    """Agrega columna de partición estándar `dt=YYYY-MM-DD` (día de corrida). Útil para DQ y backfills."""
     return df.withColumn("dt", F.lit(run_date))
 
 
 def safe_partitions(df: DataFrame) -> DataFrame:
     """
-    Evita NULLs en columnas usadas como partición (si existen).
-    Evita __HIVE_DEFAULT_PARTITION__.
+    Evita NULLs en columnas que usaremos como partición. Previene `__HIVE_DEFAULT_PARTITION__`.
+    Rellena con valores "sentinela" razonables (ej. "unknown").
     """
     fill_map = {}
     if "txn_date" in df.columns:
@@ -56,14 +69,15 @@ def safe_partitions(df: DataFrame) -> DataFrame:
 
 
 # -----------------------------
-# Lectura de SILVER (ES schema)
+# Lectura de SILVER (schema ES → alias EN)
 # -----------------------------
 def load_transactions(spark, silver_base: str, run_date: str | None) -> DataFrame:
     """
     Lee transacciones estandarizadas desde SILVER.
-    - Espera partición: silver/transactions/run_date=YYYY-MM-DD/
-    - Agrega columna txn_date = to_date(fecha) para compat
-    - Normaliza alias esperados por KPIs (unit_price, unit_cost opcional)
+    - Path esperado: `silver/transactions/run_date=YYYY-MM-DD/`.
+    - Deriva `txn_date = to_date(fecha)` para usar como **fecha de la transacción**.
+    - Crea alias comunes para KPIs: `unit_price`, `unit_cost` (si no existe) y renombres ES→EN.
+    - Si la partición exacta no existe, intenta lectura global filtrando por `run_date`.
     """
     if run_date:
         path = f"{silver_base}/transactions/run_date={run_date}"
@@ -82,15 +96,15 @@ def load_transactions(spark, silver_base: str, run_date: str | None) -> DataFram
     else:
         df = spark.read.option("mergeSchema", "true").parquet(f"{silver_base}/transactions")
 
-    # Compat: fecha -> txn_date (DATE)
+    # Compat: `fecha` → `txn_date` (DATE) si no existía.
     if "txn_date" not in df.columns and "fecha" in df.columns:
         df = df.withColumn("txn_date", F.to_date(F.col("fecha")))
 
-    # Aliases para KPIs (usamos nombres “neutros” que ya tenías)
+    # Alias para KPIs
     if "unit_price" not in df.columns and "precio" in df.columns:
         df = df.withColumn("unit_price", F.col("precio"))
 
-    # Map de renombres comunes ES -> EN
+    # Renombres comunes ES → EN (evita ifs después en cada KPI)
     rename_map = {
         # ids
         "id": "txn_id",
@@ -110,6 +124,7 @@ def load_transactions(spark, silver_base: str, run_date: str | None) -> DataFram
         if src in df.columns and tgt not in df.columns:
             df = df.withColumnRenamed(src, tgt)
 
+    # Costo unitario opcional; si no viene, lo completamos como NULL (lo estimamos en el KPI correspondiente).
     if "unit_cost" not in df.columns:
         df = df.withColumn("unit_cost", F.lit(None).cast("double"))
 
@@ -120,6 +135,7 @@ def load_transactions(spark, silver_base: str, run_date: str | None) -> DataFram
 # KPIs
 # -----------------------------
 def top_products_by_category(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
+    """Top 10 productos por categoría (por día) + variación porcentual vs día previo por producto."""
     aggregated = df.groupBy("category", "product_id", "product_name", "txn_date").agg(
         F.sum("revenue").alias("daily_revenue"),
         F.sum("quantity").alias("daily_quantity"),
@@ -151,6 +167,7 @@ def top_products_by_category(df: DataFrame, base_bucket: str, run_date: str) -> 
 
 
 def customer_frequency_ticket(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
+    """Frecuencia mensual por cliente (transacciones, ticket promedio, items comprados) y región."""
     monthly = df.withColumn("txn_month", F.date_trunc("month", "txn_date"))
     metrics = monthly.groupBy("txn_month", "customer_id", "region").agg(
         F.approx_count_distinct("txn_id").alias("transaction_count"),
@@ -171,6 +188,7 @@ def customer_frequency_ticket(df: DataFrame, base_bucket: str, run_date: str) ->
 
 
 def revenue_by_region(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
+    """Ingresos y volumen por región para ventanas **semanales** y **mensuales**."""
     weekly = df.withColumn("period_start", F.date_trunc("week", "txn_date"))
     weekly_metrics = weekly.groupBy("period_start", "region").agg(
         F.sum("revenue").alias("weekly_revenue"),
@@ -206,6 +224,7 @@ def revenue_by_region(df: DataFrame, base_bucket: str, run_date: str) -> DataFra
 
 
 def new_vs_returning(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
+    """Mix de clientes **nuevos** vs **recurrentes** por mes (ratio incluido)."""
     monthly = df.withColumn("txn_month", F.date_trunc("month", "txn_date"))
     customer_months = monthly.select("customer_id", "txn_month").distinct()
     customer_flags = (
@@ -235,6 +254,7 @@ def new_vs_returning(df: DataFrame, base_bucket: str, run_date: str) -> DataFram
 
 
 def price_volume_corr(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
+    """Correlación **precio vs volumen** por categoría (+ promedios para contexto)."""
     corr_df = df.groupBy("category").agg(
         F.corr(F.col("unit_price"), F.col("quantity")).alias("price_volume_corr"),
         F.avg("unit_price").alias("avg_unit_price"),
@@ -253,10 +273,11 @@ def price_volume_corr(df: DataFrame, base_bucket: str, run_date: str) -> DataFra
 
 
 def margin_by_product(df: DataFrame, base_bucket: str, default_cost_factor: float, run_date: str) -> DataFrame:
+    """Margen por producto. Si `unit_cost` no viene, lo **estimamos** con `unit_price * default_cost_factor`."""
     if "unit_cost" not in df.columns:
         df = df.withColumn("unit_cost", F.lit(None).cast("double"))
 
-    # unit_cost puede no existir -> estimar como unit_price * default_cost_factor
+    # Estimación de costo unitario cuando falta (p. ej. factor = 0.7 → costo ~70% del precio)
     cost = F.when(F.col("unit_cost").isNotNull(), F.col("unit_cost")) \
         .otherwise(F.col("unit_price") * F.lit(default_cost_factor))
 
@@ -279,6 +300,7 @@ def margin_by_product(df: DataFrame, base_bucket: str, default_cost_factor: floa
 
 
 def channel_payment_perf(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
+    """Performance por **canal** y **método de pago** (ingresos, items, órdenes) por día y región."""
     metrics = df.groupBy("channel", "payment_method", "region", "txn_date").agg(
         F.sum("revenue").alias("revenue"),
         F.sum("quantity").alias("items_sold"),
@@ -297,6 +319,7 @@ def channel_payment_perf(df: DataFrame, base_bucket: str, run_date: str) -> Data
 
 
 def anomalies(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
+    """Detección simple de anomalías por z‑score (≥3σ) en revenue diario por región/categoría."""
     daily = df.groupBy("txn_date", "region", "category").agg(
         F.sum("revenue").alias("daily_revenue"),
         F.sum("quantity").alias("daily_quantity"),
@@ -326,7 +349,8 @@ def anomalies(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
 
 
 def weather_impact(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
-    # Asume que df ya tiene columnas de clima (weather_avg_temp, weather_precipitation)
+    """Impacto del clima: correlación temperatura/precipitación vs revenue por región (promedios incluidos)."""
+    # Asume que df ya tiene columnas de clima (`attach_weather`).
     metrics = df.groupBy("region").agg(
         F.corr("weather_avg_temp", "revenue").alias("corr_temp_revenue"),
         F.corr("weather_precipitation", "revenue").alias("corr_precip_revenue"),
@@ -346,7 +370,14 @@ def weather_impact(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
 
 
 def fact_sales_daily(df: DataFrame, base_bucket: str, run_date: str) -> DataFrame:
-    fact = df.groupBy("txn_date", "region", "store_id", "category").agg(
+    """
+    Tabla de hechos **diaria** por (fecha, región, tienda, categoría), con KPIs habituales:
+    - orders, items_sold, revenue, unique_customers
+    - métricas de clima (promedios y código del día)
+    - `avg_ticket` (= revenue / orders, con guardia de división por 0)
+    - `channel_mix` y `payment_mix` como mapas {canal→revenue} y {método→revenue}
+    """
+    fact = df.groupBy("txn_date", "region", "store_id", "category`).agg(
         F.approx_count_distinct("txn_id").alias("orders"),
         F.sum("quantity").alias("items_sold"),
         F.sum("revenue").alias("revenue"),
@@ -363,6 +394,7 @@ def fact_sales_daily(df: DataFrame, base_bucket: str, run_date: str) -> DataFram
         F.when(F.col("orders") > 0, F.col("revenue").cast("double") / F.col("orders")).otherwise(F.lit(0.0)),
     )
 
+    # Mezcla por canal (map) → útil para dashboards sin pivotar previamente.
     channel_mix = df.groupBy("txn_date", "region", "store_id", "category", "channel").agg(
         F.sum("revenue").alias("channel_revenue")
     )
@@ -370,6 +402,7 @@ def fact_sales_daily(df: DataFrame, base_bucket: str, run_date: str) -> DataFram
         F.map_from_entries(F.collect_list(F.struct("channel", "channel_revenue"))).alias("channel_mix")
     )
 
+    # Mezcla por método de pago (map)
     payment_mix = df.groupBy("txn_date", "region", "store_id", "category", "payment_method").agg(
         F.sum("revenue").alias("payment_revenue")
     )
@@ -377,9 +410,11 @@ def fact_sales_daily(df: DataFrame, base_bucket: str, run_date: str) -> DataFram
         F.map_from_entries(F.collect_list(F.struct("payment_method", "payment_revenue"))).alias("payment_mix")
     )
 
+    # Join de mixes
     fact = fact.join(channel_mix, ["txn_date", "region", "store_id", "category"], "left")
     fact = fact.join(payment_mix, ["txn_date", "region", "store_id", "category"], "left")
 
+    # Escritura particionada
     output_path = f"{base_bucket}/{FACT_PATH}"
     fact_to_write = repartition_if_necessary(safe_partitions(with_dt(fact, run_date)))
     (
@@ -393,36 +428,41 @@ def fact_sales_daily(df: DataFrame, base_bucket: str, run_date: str) -> DataFram
 
 
 # -----------------------------
-# Main
+# Main (orquestación del job)
 # -----------------------------
 def main(argv: List[str] | None = None) -> int:
     def additional(parser):
+        # Parámetros específicos de GOLD
         parser.add_argument("--default_cost_factor", type=float, default=0.7)
         parser.add_argument("--silver_prefix", default="silver")
 
+    # Parseo de args y utilidades comunes (logger, spark, run_date, etc.)
     args = parse_args("Gold analytics job", extra_args=[additional])
     run_date = ensure_run_date(args.run_date)
     logger = build_logger("gold_analytics")
 
     spark = build_spark_session("gold_analytics")
 
-    # ✅ Idempotencia por partición
+    # ✅ Idempotencia por partición: sólo sobreescribimos la partición escrita
     spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
     base_bucket = args.input_bucket.rstrip("/")
 
-    # Ajuste: path de referencia para decidir particiones de shuffle → usamos partición run_date
+    # Ajuste de particiones de shuffle según tamaño de entrada (mejora performance y evita skew)
     configure_shuffle_partitions(
         spark,
         paths=[f"{base_bucket}/{args.silver_prefix}/transactions/run_date={run_date}"],
         override=args.shuffle_partitions,
     )
 
+    # 1) Carga de SILVER
     transactions = load_transactions(spark, f"{base_bucket}/{args.silver_prefix}", run_date)
-    # leer weather y adjuntar
+
+    # 2) Carga y **adjunto** de clima (left join por fecha y, si existe, región)
     weather = load_weather(spark, f"{base_bucket}/{args.silver_prefix}", run_date)
     transactions = attach_weather(transactions, weather)
 
+    # Cache para reutilizar el mismo DF en todos los KPIs
     transactions.cache()
     logger.info(
         "Loaded %s rows from silver transactions (with weather columns: %s)",
@@ -431,6 +471,7 @@ def main(argv: List[str] | None = None) -> int:
                    if c in transactions.columns])
     )
 
+    # 3) Construcción de KPIs (cada función escribe su salida y devuelve un DF para logging/validación)
     outputs = {}
     outputs["top_products_by_category"] = top_products_by_category(transactions, base_bucket, run_date)
     outputs["customer_frequency_ticket"] = customer_frequency_ticket(transactions, base_bucket, run_date)
@@ -443,8 +484,11 @@ def main(argv: List[str] | None = None) -> int:
     outputs["channel_payment_perf"] = channel_payment_perf(transactions, base_bucket, run_date)
     outputs["anomalies"] = anomalies(transactions, base_bucket, run_date)
     outputs["weather_impact"] = weather_impact(transactions, base_bucket, run_date)
+
+    # 4) Tabla de hechos
     fact_df = fact_sales_daily(transactions, base_bucket, run_date)
 
+    # 5) Registro de tablas (metastore/Glue/Athena) para consulta directa
     for name, df in outputs.items():
         table_name = f"gold_kpi_{name}"
         register_table(spark, table_name, f"{base_bucket}/{GOLD_KPI_PATHS[name]}")
@@ -456,7 +500,11 @@ def main(argv: List[str] | None = None) -> int:
     return 0
 
 
+# -----------------------------
+# Lectura de weather desde SILVER y join con transacciones
+# -----------------------------
 def load_weather(spark, silver_base: str, run_date: str) -> DataFrame | None:
+    """Lee la partición diaria de clima. Si no está, sigue sin clima (robusto a faltantes)."""
     path = f"{silver_base}/weather_daily/run_date={run_date}"
     try:
         df = (spark.read
@@ -470,6 +518,10 @@ def load_weather(spark, silver_base: str, run_date: str) -> DataFrame | None:
 
 
 def attach_weather(transactions: DataFrame, weather: DataFrame | None) -> DataFrame:
+    """
+    Adjunta columnas de clima a las transacciones por **fecha** y, si existe, por **región**.
+    Si `weather` es None, crea columnas de clima como NULL para no romper KPIs que las usan.
+    """
     if weather is None:
         df = transactions
         for name, dtype in [("weather_avg_temp", "double"),
@@ -484,7 +536,7 @@ def attach_weather(transactions: DataFrame, weather: DataFrame | None) -> DataFr
     desired = ["weather_avg_temp", "weather_precipitation", "weather_code",
                "weather_wind_speed", "weather_humidity"]
     base_cols = ["weather_date"]
-    # si hay 'region' en weather, la usamos; si no, no
+    # Si hay 'region' en weather, la usamos en el join.
     if "region" in weather.columns:
         base_cols = ["region", "weather_date"]
 
@@ -492,13 +544,13 @@ def attach_weather(transactions: DataFrame, weather: DataFrame | None) -> DataFr
     w = weather.select(*([c for c in base_cols if c in weather.columns] + existing_weather_cols)).alias("w")
     t = transactions.alias("t")
 
-    # detectar si weather.region está completamente nulo
+    # Detección rápida: ¿hay alguna región no nula en weather?
     join_on_region = "region" in w.columns and w.filter(F.col("region").isNotNull()).limit(1).count() > 0
 
     if join_on_region:
         cond = (F.col("t.region") == F.col("w.region")) & (F.col("t.txn_date") == F.col("w.weather_date"))
     else:
-        # fallback: solo por fecha
+        # Fallback si weather.region está vacío: join solo por fecha
         cond = (F.col("t.txn_date") == F.col("w.weather_date"))
 
     df = (
@@ -509,7 +561,7 @@ def attach_weather(transactions: DataFrame, weather: DataFrame | None) -> DataFr
         )
     )
 
-    # crear columnas faltantes como NULL (ej. weather_code) si hiciera falta
+    # Garantizamos columnas de clima aunque falte alguna
     for c in desired:
         if c not in df.columns:
             dtype = "double" if c != "weather_code" else "string"
